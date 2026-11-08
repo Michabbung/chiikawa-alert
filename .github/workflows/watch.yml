@@ -422,17 +422,34 @@ jobs:
                   log("롯데시네마 지점 코드:", found, "| 비슷한 이름:", hint)
                   return found
 
-              def schedule(self, cinema_id):
+              def schedule(self, cinema_id, name):
                   t = TARGET_DATE
                   data = self.call({"MethodName": "GetPlaySequence",
                                     "playDate": f"{t[:4]}-{t[4:6]}-{t[6:]}",
                                     "cinemaID": cinema_id, "representationMovieCode": ""})
-                  rows = []
+                  rows, logged = [], False
                   for d in find_dicts(data, "StartTime"):
-                      if MOVIE_KEY in str(d.get("MovieNameKR", "")) and same_date(d.get("PlayDt")):
-                          rows.append({"time": hhmm(d.get("StartTime")),
-                                       "seats": to_int(d.get("BookingSeatCount")),
-                                       "screen": str(d.get("ScreenNameKR") or "")})
+                      if MOVIE_KEY not in str(d.get("MovieNameKR", "")):
+                          continue
+                      if not logged:  # 확인용: 첫 항목의 주요 값 기록
+                          keys = ("CinemaNameKR", "PlayDt", "StartTime", "ScreenNameKR",
+                                  "IsBookingYN", "BookingSeatCount")
+                          log("롯데 응답 예시:", {k: d.get(k) for k in keys})
+                          logged = True
+                      # 날짜가 정확히 11/11 인 것만 (날짜 칸이 없으면 제외)
+                      day = d.get("PlayDt") or d.get("PlayDate") or d.get("PlayDe")
+                      if not day or not same_date(day):
+                          continue
+                      # 다른 지점 회차가 섞여 오면 제외
+                      cname = str(d.get("CinemaNameKR") or "")
+                      if cname and name not in cname:
+                          continue
+                      # 화면엔 보여도 아직 예매가 안 열린 회차는 제외
+                      if str(d.get("IsBookingYN") or "Y").upper() != "Y":
+                          continue
+                      rows.append({"time": hhmm(d.get("StartTime")),
+                                   "seats": to_int(d.get("BookingSeatCount")),
+                                   "screen": str(d.get("ScreenNameKR") or "")})
                   rows.sort(key=lambda x: x["time"])
                   return rows
 
@@ -513,13 +530,14 @@ jobs:
                       cinemas.update(lotte.find_cinemas(missing))
                   except Exception as e:  # noqa: BLE001
                       errors.append(f"롯데시네마 지점 목록: {e}")
-              lotte_seen = st.setdefault("lotte_seen", {})
+              st.pop("lotte_seen", None)  # 예전 버전이 잘못 기록한 값은 버림
+              lotte_seen = st.setdefault("lotte_seen_v2", {})
               for n in LOTTE_THEATERS:
                   if n not in cinemas:
                       errors.append(f"롯데시네마 {n}: 지점 코드를 못 찾음")
                       continue
                   try:
-                      rows = [r for r in lotte.schedule(cinemas[n]) if r["time"] < LOTTE_BEFORE]
+                      rows = [r for r in lotte.schedule(cinemas[n], n) if r["time"] < LOTTE_BEFORE]
                   except Exception as e:  # noqa: BLE001
                       errors.append(f"롯데시네마 {n}: {e}")
                       continue
@@ -527,7 +545,8 @@ jobs:
                   if not rows:
                       status.append(f"롯데시네마 {n}: {pretty(LOTTE_BEFORE)} 이전 회차 아직 안 열림")
                   else:
-                      status.append(f"롯데시네마 {n}: {pretty(LOTTE_BEFORE)} 이전 {len(rows)}회차 열림")
+                      times = ", ".join(pretty(r["time"]) for r in rows)
+                      status.append(f"롯데시네마 {n}: {pretty(LOTTE_BEFORE)} 이전 열림 ({times})")
                   new_open = False
                   for r in rows:
                       key = f"{r['time']}|{r['screen']}"

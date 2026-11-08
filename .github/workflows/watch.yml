@@ -5,7 +5,7 @@ name: chiikawa-alert
 
 on:
   schedule:
-    - cron: "7 * * * *"     # 매시간 예약. 한 번 돌면 약 5시간 40분 동안 30초 간격으로 확인하고,
+    - cron: "7 * * * *"     # 매시간 예약. 한 번 돌면 약 5시간 30분 동안 30초 간격으로 확인하고,
                             # 끝나면 대기 중이던 다음 실행이 바로 이어받음
   workflow_dispatch:         # Actions 탭에서 'Run workflow'로 바로 실행(테스트용)
 
@@ -27,7 +27,9 @@ jobs:
           python-version: "3.12"
 
       - name: Install
-        run: pip install curl_cffi
+        run: |
+          pip install curl_cffi playwright
+          python -m playwright install --with-deps chromium
 
       - name: Restore state
         uses: actions/cache/restore@v4
@@ -73,7 +75,8 @@ jobs:
           LOTTE_BEFORE = "1430"               # 롯데시네마는 이 시각 이전 회차만 감시
           STOP_AT_TIME = "1435"               # 11/11 이 시각이 지나면 봇이 스스로 꺼짐
           INTERVAL_SEC = 30                   # 확인 간격(초)
-          LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "340"))
+          CGV_RETRY_SEC = 600                 # CGV 가 막히면 이만큼 쉬었다가 다시 시도(초)
+          LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "330"))
           STATE_FILE = "state/state.json"
           # ==========================================
 
@@ -195,29 +198,110 @@ jobs:
 
 
           # ---------------- CGV ----------------
+          class CGVBlocked(RuntimeError):
+              pass
+
+
+          CHROME_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+          FETCH_JS = """async (u) => {
+            const r = await fetch(u, {credentials: 'include',
+              headers: {'Accept': 'application/json, text/plain, */*'}});
+            return {status: r.status, text: await r.text()};
+          }"""
+
+
           class CGV:
+              """CGV 는 봇 차단이 있어서 1) 여러 브라우저 지문으로 접속 시도, 2) 안 되면 진짜 브라우저로 접속."""
               BASE = "https://cgv.co.kr"
+              IMPERSONATE = ("chrome", "chrome131", "safari17_0", "edge101", "firefox133")
 
               def __init__(self):
+                  self.mode = None      # "curl" 또는 "browser"
                   self.s = None
+                  self.pw = self.browser = self.page = None
 
-              def _session(self):
-                  if self.s is None:
-                      self.s = cr.Session(impersonate="chrome")
-                      r = self.s.get(CGV_LINK, timeout=20)
-                      log("CGV 세션 시작 HTTP", r.status_code)
-                  return self.s
+              # --- 접속 ---
+              def _connect(self):
+                  for imp in self.IMPERSONATE:
+                      try:
+                          s = cr.Session(impersonate=imp)
+                          r = s.get(CGV_LINK, timeout=20)
+                      except Exception as e:  # noqa: BLE001
+                          log("CGV 접속 시도", imp, "실패:", e)
+                          continue
+                      log("CGV 접속 시도", imp, "HTTP", r.status_code)
+                      if r.status_code == 200:
+                          self.s, self.mode = s, "curl"
+                          return
+                  if self._browser_start():
+                      self.mode = "browser"
+                      return
+                  raise CGVBlocked("CGV 접속이 막힘(403)")
+
+              def _browser_start(self):
+                  try:
+                      from playwright.sync_api import sync_playwright
+                  except ImportError:
+                      log("브라우저(playwright) 없음")
+                      return False
+                  try:
+                      self.pw = sync_playwright().start()
+                      self.browser = self.pw.chromium.launch(
+                          headless=True, args=["--disable-blink-features=AutomationControlled"])
+                      ctx = self.browser.new_context(locale="ko-KR", user_agent=CHROME_UA,
+                                                     viewport={"width": 1280, "height": 900})
+                      ctx.add_init_script(
+                          "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
+                      self.page = ctx.new_page()
+                      resp = self.page.goto(CGV_LINK, wait_until="domcontentloaded", timeout=45000)
+                      log("CGV 브라우저 접속 HTTP", resp.status if resp else "?")
+                      for _ in range(12):  # 봇 확인 화면이면 최대 30초 기다림
+                          title = self.page.title() or ""
+                          if "moment" not in title.lower() and "잠시" not in title:
+                              break
+                          self.page.wait_for_timeout(2500)
+                      code, _ = self._browser_get("/api/v1/booking/searchRegnList", {"coCd": "A420"})
+                      log("CGV 브라우저 모드 테스트 HTTP", code)
+                      if code == 200:
+                          return True
+                  except Exception as e:  # noqa: BLE001
+                      log("CGV 브라우저 접속 실패:", e)
+                  self._browser_stop()
+                  return False
+
+              def _browser_stop(self):
+                  try:
+                      if self.browser:
+                          self.browser.close()
+                      if self.pw:
+                          self.pw.stop()
+                  except Exception:  # noqa: BLE001
+                      pass
+                  self.pw = self.browser = self.page = None
+
+              def _browser_get(self, path, params):
+                  url = self.BASE + path + "?" + urllib.parse.urlencode(params)
+                  res = self.page.evaluate(FETCH_JS, url)
+                  return int(res.get("status", 0)), res.get("text", "")
 
               def get(self, path, params):
-                  r = self._session().get(
-                      self.BASE + path, params=params, timeout=20,
-                      headers={"Accept": "application/json, text/plain, */*",
-                               "Accept-Language": "ko-KR,ko;q=0.9", "Referer": CGV_LINK})
-                  if r.status_code != 200:
-                      if r.status_code in (403, 429):
-                          self.s = None  # 다음 번엔 세션 새로 발급
-                      raise RuntimeError(f"CGV HTTP {r.status_code}")
-                  return r.json()
+                  if self.mode is None:
+                      self._connect()
+                  if self.mode == "curl":
+                      r = self.s.get(self.BASE + path, params=params, timeout=20,
+                                     headers={"Accept": "application/json, text/plain, */*",
+                                              "Accept-Language": "ko-KR,ko;q=0.9", "Referer": CGV_LINK})
+                      code, text = r.status_code, r.text
+                  else:
+                      code, text = self._browser_get(path, params)
+                  if code != 200:
+                      if code in (403, 429):
+                          self.mode = None
+                          self._browser_stop()
+                          raise CGVBlocked(f"CGV 접속이 막힘({code})")
+                      raise RuntimeError(f"CGV HTTP {code}")
+                  return json.loads(text)
 
               def find_sites(self, names):
                   found, seen = {}, {}
@@ -225,6 +309,8 @@ jobs:
                                "/api/v1/booking/searchRegnList"):
                       try:
                           data = self.get(path, {"coCd": "A420"})
+                      except CGVBlocked:
+                          raise
                       except Exception as e:  # noqa: BLE001
                           log("CGV 극장 목록 실패", path, e)
                           continue
@@ -373,14 +459,25 @@ jobs:
               except Exception as e:  # noqa: BLE001
                   errors.append(f"메가박스: {e}")
 
-              # CGV 3곳
+              # CGV 3곳 (막히면 10분 쉬었다가 다시 시도)
+              if time.time() < st.get("cgv_retry_at", 0):
+                  status.append("CGV: 접속이 막혀서 잠시 쉬는 중 (10분마다 재시도)")
+                  check_lotte(st, lotte, alerts, status, errors)
+                  return alerts, status, errors
+              try:
+                  check_cgv(st, cgv, alerts, status, errors)
+              except CGVBlocked as e:
+                  st["cgv_retry_at"] = time.time() + CGV_RETRY_SEC
+                  errors.append(f"CGV: {e} - 10분 뒤 다시 시도")
+              check_lotte(st, lotte, alerts, status, errors)
+              return alerts, status, errors
+
+
+          def check_cgv(st, cgv, alerts, status, errors):
               sites = st.setdefault("cgv_sites", {})
               missing = [n for n in CGV_THEATERS if n not in sites]
               if missing:
-                  try:
-                      sites.update(cgv.find_sites(missing))
-                  except Exception as e:  # noqa: BLE001
-                      errors.append(f"CGV 극장 목록: {e}")
+                  sites.update(cgv.find_sites(missing))
               opened = st.setdefault("cgv_open", {})
               first_seats = st.setdefault("cgv_first_seats", {})
               for n in CGV_THEATERS:
@@ -389,6 +486,8 @@ jobs:
                       continue
                   try:
                       rows = cgv.schedule(sites[n])
+                  except CGVBlocked:
+                      raise
                   except Exception as e:  # noqa: BLE001
                       errors.append(f"CGV {n}: {e}")
                       continue
@@ -404,7 +503,9 @@ jobs:
                       alerts.append(f"🎉 CGV {n} 취소표!")
                   first_seats[n] = first["seats"]
 
-              # 롯데시네마 (14:30 이전 회차)
+
+          def check_lotte(st, lotte, alerts, status, errors):
+              """롯데시네마 (14:30 이전 회차)"""
               cinemas = st.setdefault("lotte_cinemas", {})
               missing = [n for n in LOTTE_THEATERS if n not in cinemas]
               if missing:
@@ -435,7 +536,6 @@ jobs:
                       seen[key] = r["seats"]
                   if new_open:
                       alerts.append(f"🎬 롯데시네마 {n} 열림!")
-              return alerts, status, errors
 
 
           def main():
@@ -466,24 +566,28 @@ jobs:
                       else:
                           log("텔레그램 대화방을 못 찾음: 봇에게 아무 메시지나 보내 주세요")
 
-                  alerts, status, errors = check_once(st, cgv, mega, lotte)
-                  for line in status + errors:
-                      log(line)
+                  if st.get("chat_id"):  # 알림 받을 곳이 생긴 뒤에만 확인 (알림이 버려지지 않게)
+                      alerts, status, errors = check_once(st, cgv, mega, lotte)
+                      for line in status + errors:
+                          log(line)
 
-                  if newly_linked or (MANUAL and first_cycle):
-                      head = "✅ 치이카와 알림봇 연결 완료!" if newly_linked else "📋 지금 상황"
-                      body = "\n".join(f"· {s}" for s in status) or "· (확인된 정보 없음)"
-                      if errors:
-                          body += "\n⚠️ " + "\n⚠️ ".join(errors)
-                      send(st, f"{head}\n{body}")
-                  for a in alerts:
-                      send(st, a)
+                      if newly_linked or (MANUAL and first_cycle):
+                          head = "✅ 치이카와 알림봇 연결 완료!" if newly_linked else "📋 지금 상황"
+                          body = "\n".join(f"· {s}" for s in status) or "· (확인된 정보 없음)"
+                          if errors:
+                              body += "\n⚠️ " + "\n⚠️ ".join(errors)
+                          send(st, f"{head}\n{body}")
+                      for a in alerts:
+                          send(st, a)
 
-                  if errors and not st.get("err_notified") and not (MANUAL and first_cycle):
-                      if send(st, "⚠️ 알림봇 확인 중 오류가 났어요 (계속 재시도 중)\n" + "\n".join(errors)):
-                          st["err_notified"] = True
-                  if not errors:
-                      st["err_notified"] = False
+                      # 같은 종류의 오류는 한 번만 알림 (CGV 쉬는 중에는 오류 기록 유지)
+                      kinds = sorted({e.split(":")[0] for e in errors})
+                      if kinds and kinds != st.get("err_kinds") and not (MANUAL and first_cycle):
+                          send(st, "⚠️ 알림봇 오류 (계속 재시도 중)\n" + "\n".join(errors))
+                      if kinds:
+                          st["err_kinds"] = kinds
+                      elif time.time() >= st.get("cgv_retry_at", 0):
+                          st["err_kinds"] = []
 
                   save_state(st)
                   first_cycle = False

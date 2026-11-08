@@ -1,0 +1,512 @@
+# 치이카와 11/11 회차 알림봇 (CGV 연남·신촌아트레온·홍대 / 메가박스 홍대 / 롯데시네마 홍대입구)
+# 이 파일 하나만 저장소의 .github/workflows/watch.yml 에 넣으면 됩니다.
+# 필요한 것: Settings > Secrets and variables > Actions 에 TELEGRAM_BOT_TOKEN 등록
+name: chiikawa-alert
+
+on:
+  schedule:
+    - cron: "7 * * * *"     # 매시간 예약. 한 번 돌면 약 5시간 40분 동안 30초 간격으로 확인하고,
+                            # 끝나면 대기 중이던 다음 실행이 바로 이어받음
+  workflow_dispatch:         # Actions 탭에서 'Run workflow'로 바로 실행(테스트용)
+
+permissions:
+  contents: read
+  actions: write             # 11/11 감시가 끝나면 스스로 끄기 위해 필요
+
+concurrency:
+  group: chiikawa-alert
+  cancel-in-progress: false
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install
+        run: pip install curl_cffi
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
+      - name: Watch
+        id: watch
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        run: |
+          mkdir -p state
+          cat > watch.py <<'PYEOF'
+          """치이카와 극장판 11/11 회차 알림봇.
+
+          - CGV 연남 / 신촌아트레온 / 홍대: 11/11 치이카와 회차가 열리면 알림,
+            열린 뒤에는 첫 회차가 매진됐다가 자리가 나면 알림
+          - 메가박스 홍대: 11/11 11:05 회차 잔여석이 0 -> 1 이상이 되면 알림
+          - 롯데시네마 홍대입구: 11/11 14:30 이전 회차가 새로 열리면 알림 (취소표 알림 없음)
+          - 알림은 텔레그램 봇으로 보냄 (토큰은 GitHub Secrets 의 TELEGRAM_BOT_TOKEN)
+          """
+          import datetime as dt
+          import json
+          import os
+          import random
+          import re
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
+
+          from curl_cffi import requests as cr
+
+          # ===== 설정 (바꾸고 싶으면 여기만 수정) =====
+          TARGET_DATE = "20261111"            # 감시할 상영일
+          MOVIE_KEY = "치이카와"               # 영화 제목에 이 글자가 들어가면 대상
+          CGV_THEATERS = ["연남", "신촌아트레온", "홍대"]
+          MEGA_THEATER = "홍대"
+          MEGA_TIME = "1105"                  # 메가박스 감시 회차 시작 시각 (HHMM)
+          LOTTE_THEATERS = ["홍대입구"]        # 롯데시네마 지점 이름
+          LOTTE_BEFORE = "1430"               # 롯데시네마는 이 시각 이전 회차만 감시
+          STOP_AT_TIME = "1435"               # 11/11 이 시각이 지나면 봇이 스스로 꺼짐
+          INTERVAL_SEC = 30                   # 확인 간격(초)
+          LOOP_MINUTES = int(os.environ.get("LOOP_MINUTES", "340"))
+          STATE_FILE = "state/state.json"
+          # ==========================================
+
+          KST = dt.timezone(dt.timedelta(hours=9))
+          STOP_AT = dt.datetime(int(TARGET_DATE[:4]), int(TARGET_DATE[4:6]), int(TARGET_DATE[6:]),
+                                int(STOP_AT_TIME[:2]), int(STOP_AT_TIME[2:]), tzinfo=KST)
+          DATE_LABEL = f"{int(TARGET_DATE[4:6])}/{int(TARGET_DATE[6:])}"
+          CGV_LINK = "https://cgv.co.kr/cnm/movieBook"
+          MEGA_LINK = "https://www.megabox.co.kr/booking"
+          LOTTE_LINK = "https://www.lottecinema.co.kr/NLCHS/Ticketing"
+
+          TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+          MANUAL = os.environ.get("GITHUB_EVENT_NAME") == "workflow_dispatch"
+
+
+          def now_kst():
+              return dt.datetime.now(KST)
+
+
+          def log(*a):
+              print(now_kst().strftime("[%m/%d %H:%M:%S]"), *a, flush=True)
+
+
+          def to_int(v):
+              try:
+                  return int(str(v).strip())
+              except (TypeError, ValueError):
+                  return 0
+
+
+          def hhmm(v):
+              s = re.sub(r"\D", "", str(v))
+              return s.zfill(4)[:4] if s else ""
+
+
+          def pretty(t):
+              return f"{t[:2]}:{t[2:]}" if len(t) == 4 else t
+
+
+          def same_date(v):
+              s = re.sub(r"\D", "", str(v or ""))
+              return not s or s[:8] == TARGET_DATE
+
+
+          def find_dicts(obj, key):
+              """JSON 안 어디에 있든 key 를 가진 dict 를 모두 찾는다 (응답 구조가 바뀌어도 버티도록)."""
+              if isinstance(obj, dict):
+                  if key in obj:
+                      yield obj
+                  for v in obj.values():
+                      yield from find_dicts(v, key)
+              elif isinstance(obj, list):
+                  for v in obj:
+                      yield from find_dicts(v, key)
+
+
+          def pick_by_name(names, seen):
+              """극장 이름 목록과 {사이트 이름: 코드} 를 맞춰 {이름: 코드} 를 만든다."""
+              found = {}
+              for n in names:
+                  exact = [k for k in seen if re.sub(r"^(CGV|롯데시네마)\s*", "", k).strip() == n]
+                  part = [k for k in seen if n in k]
+                  cands = exact or part
+                  if cands:
+                      found[n] = seen[sorted(cands, key=len)[0]]
+              return found
+
+
+          # ---------------- 상태 저장 ----------------
+          def load_state():
+              try:
+                  with open(STATE_FILE, encoding="utf-8") as f:
+                      return json.load(f)
+              except (OSError, ValueError):
+                  return {}
+
+
+          def save_state(st):
+              os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+              with open(STATE_FILE, "w", encoding="utf-8") as f:
+                  json.dump(st, f, ensure_ascii=False, indent=1)
+
+
+          # ---------------- 텔레그램 ----------------
+          def tg(method, params):
+              url = f"https://api.telegram.org/bot{TOKEN}/{method}"
+              data = urllib.parse.urlencode(params).encode()
+              with urllib.request.urlopen(url, data=data, timeout=20) as r:
+                  return json.loads(r.read().decode())
+
+
+          def find_chat_id():
+              try:
+                  res = tg("getUpdates", {"timeout": 0})
+              except Exception as e:  # noqa: BLE001
+                  log("getUpdates 실패:", e)
+                  return None
+              chat_id = None
+              for u in res.get("result", []):
+                  msg = u.get("message") or u.get("edited_message") or {}
+                  chat = msg.get("chat") or {}
+                  if chat.get("type") == "private":
+                      chat_id = chat.get("id")
+              return chat_id
+
+
+          def send(st, text):
+              if not st.get("chat_id"):
+                  log("chat_id 없음 - 보낼 수 없음:", text)
+                  return False
+              try:
+                  tg("sendMessage", {"chat_id": st["chat_id"], "text": text,
+                                     "disable_web_page_preview": "true"})
+                  log("텔레그램 전송:", text.splitlines()[0])
+                  return True
+              except Exception as e:  # noqa: BLE001
+                  log("텔레그램 전송 실패:", e)
+                  return False
+
+
+          # ---------------- CGV ----------------
+          class CGV:
+              BASE = "https://cgv.co.kr"
+
+              def __init__(self):
+                  self.s = None
+
+              def _session(self):
+                  if self.s is None:
+                      self.s = cr.Session(impersonate="chrome")
+                      r = self.s.get(CGV_LINK, timeout=20)
+                      log("CGV 세션 시작 HTTP", r.status_code)
+                  return self.s
+
+              def get(self, path, params):
+                  r = self._session().get(
+                      self.BASE + path, params=params, timeout=20,
+                      headers={"Accept": "application/json, text/plain, */*",
+                               "Accept-Language": "ko-KR,ko;q=0.9", "Referer": CGV_LINK})
+                  if r.status_code != 200:
+                      if r.status_code in (403, 429):
+                          self.s = None  # 다음 번엔 세션 새로 발급
+                      raise RuntimeError(f"CGV HTTP {r.status_code}")
+                  return r.json()
+
+              def find_sites(self, names):
+                  found, seen = {}, {}
+                  for path in ("/api/v1/content/site/searchAllRegionAndSite",
+                               "/api/v1/booking/searchRegnList"):
+                      try:
+                          data = self.get(path, {"coCd": "A420"})
+                      except Exception as e:  # noqa: BLE001
+                          log("CGV 극장 목록 실패", path, e)
+                          continue
+                      for d in find_dicts(data, "siteNo"):
+                          nm = str(d.get("siteNm") or d.get("siteName") or d.get("siteAbbrNm") or "")
+                          if nm:
+                              seen[nm] = str(d["siteNo"])
+                      found.update(pick_by_name([n for n in names if n not in found], seen))
+                      if len(found) == len(names):
+                          break
+                  hint = [k for k in seen if any(x in k for x in ("홍", "신촌", "연남"))]
+                  log("CGV 극장 코드:", found, "| 비슷한 이름:", hint)
+                  return found
+
+              def schedule(self, site_no):
+                  data = self.get("/api/v1/booking/searchMovScnInfo",
+                                  {"coCd": "A420", "siteNo": site_no,
+                                   "scnYmd": TARGET_DATE, "rtctlScopCd": "08"})
+                  if isinstance(data, dict) and data.get("statusCode") not in (None, 0, "0"):
+                      raise RuntimeError(f"CGV API 오류: {data.get('statusMessage')}")
+                  rows = []
+                  for d in find_dicts(data, "scnsrtTm"):
+                      if MOVIE_KEY in str(d.get("movNm", "")) and same_date(d.get("scnYmd")):
+                          rows.append({"time": hhmm(d.get("scnsrtTm")),
+                                       "seats": to_int(d.get("frSeatCnt")),
+                                       "screen": str(d.get("scnsNm") or "")})
+                  rows.sort(key=lambda x: x["time"])
+                  return rows
+
+
+          # ---------------- 메가박스 ----------------
+          class Mega:
+              URL = "https://www.megabox.co.kr/on/oh/ohc/Brch/schedulePage.do"
+
+              def __init__(self):
+                  self.s = cr.Session(impersonate="chrome")
+
+              def find_brch(self, name):
+                  if os.environ.get("MEGABOX_BRCH_NO"):
+                      return os.environ["MEGABOX_BRCH_NO"].strip()
+                  try:
+                      html = self.s.get("https://www.megabox.co.kr/theater/list", timeout=20).text
+                      pats = (r'brchNo=(\d+)"[^>]*?title="\s*([^"]+?)\s*상세보기',
+                              r'brchNo=(\d+)[^>]*>\s*([^<]+?)\s*<')
+                      for pat in pats:
+                          for m in re.finditer(pat, html):
+                              if m.group(2).strip() == name:
+                                  log("메가박스 지점 코드:", name, m.group(1))
+                                  return m.group(1)
+                  except Exception as e:  # noqa: BLE001
+                      log("메가박스 지점 목록 실패:", e)
+                  log("메가박스 지점 코드를 못 찾아 기본값 1212 사용")
+                  return "1212"
+
+              def schedule(self, brch):
+                  body = {"masterType": "brch", "detailType": "area", "brchNo": brch,
+                          "firstAt": "N", "brchNo1": brch,
+                          "crtDe": now_kst().strftime("%Y%m%d"), "playDe": TARGET_DATE}
+                  r = self.s.post(self.URL, json=body, timeout=20, headers={
+                      "Accept": "application/json, text/javascript, */*; q=0.01",
+                      "X-Requested-With": "XMLHttpRequest",
+                      "Origin": "https://www.megabox.co.kr",
+                      "Referer": "https://www.megabox.co.kr/booking/timetable"})
+                  if r.status_code != 200:
+                      raise RuntimeError(f"메가박스 HTTP {r.status_code}")
+                  rows = []
+                  for d in find_dicts(r.json(), "playStartTime"):
+                      if MOVIE_KEY in str(d.get("movieNm", "")) and same_date(d.get("playDe")):
+                          rows.append({"time": hhmm(d.get("playStartTime")),
+                                       "seats": to_int(d.get("restSeatCnt")),
+                                       "screen": str(d.get("theabExpoNm") or ""),
+                                       "brch": str(d.get("brchNm") or "")})
+                  rows.sort(key=lambda x: x["time"])
+                  return rows
+
+
+          # ---------------- 롯데시네마 ----------------
+          class Lotte:
+              URL = "https://www.lottecinema.co.kr/LCWS/Ticketing/TicketingData.aspx"
+
+              def __init__(self):
+                  self.s = cr.Session(impersonate="chrome")
+
+              def call(self, params):
+                  p = {"channelType": "HO", "osType": "Chrome", "osVersion": "Mozilla/5.0"}
+                  p.update(params)
+                  r = self.s.post(self.URL, data={"paramList": json.dumps(p, ensure_ascii=False)},
+                                  timeout=20, headers={
+                                      "Accept": "application/json, text/plain, */*",
+                                      "Origin": "https://www.lottecinema.co.kr",
+                                      "Referer": LOTTE_LINK})
+                  if r.status_code != 200:
+                      raise RuntimeError(f"롯데시네마 HTTP {r.status_code}")
+                  return r.json()
+
+              def find_cinemas(self, names):
+                  data = self.call({"MethodName": "GetTicketingPageTOBE", "memberOnNo": "0"})
+                  seen, div = {}, {}
+                  for d in find_dicts(data, "CinemaID"):
+                      nm = str(d.get("CinemaNameKR") or "").strip()
+                      if not nm or d.get("DivisionCode") is None:
+                          continue
+                      code = f"{d.get('DivisionCode')}|{d.get('DetailDivisionCode')}|{d.get('CinemaID')}"
+                      # 같은 지점이 여러 번 나오면 일반 상영(DivisionCode 1)을 우선
+                      if nm not in seen or str(d.get("DivisionCode")) == "1" and div.get(nm) != "1":
+                          seen[nm], div[nm] = code, str(d.get("DivisionCode"))
+                  found = pick_by_name(names, seen)
+                  hint = [k for k in seen if any(x in k for x in ("홍", "신촌", "합정"))]
+                  log("롯데시네마 지점 코드:", found, "| 비슷한 이름:", hint)
+                  return found
+
+              def schedule(self, cinema_id):
+                  t = TARGET_DATE
+                  data = self.call({"MethodName": "GetPlaySequence",
+                                    "playDate": f"{t[:4]}-{t[4:6]}-{t[6:]}",
+                                    "cinemaID": cinema_id, "representationMovieCode": ""})
+                  rows = []
+                  for d in find_dicts(data, "StartTime"):
+                      if MOVIE_KEY in str(d.get("MovieNameKR", "")) and same_date(d.get("PlayDt")):
+                          rows.append({"time": hhmm(d.get("StartTime")),
+                                       "seats": to_int(d.get("BookingSeatCount")),
+                                       "screen": str(d.get("ScreenNameKR") or "")})
+                  rows.sort(key=lambda x: x["time"])
+                  return rows
+
+
+          # ---------------- 한 번 확인 ----------------
+          def check_once(st, cgv, mega, lotte):
+              """한 바퀴 확인. 알림 보낼 문장 목록, 현황 문장 목록, 오류 목록을 돌려준다."""
+              alerts, status, errors = [], [], []
+
+              # 메가박스 홍대 11:05
+              try:
+                  rows = mega.schedule(st["mega_brch"])
+                  if rows and MEGA_THEATER not in rows[0].get("brch", MEGA_THEATER):
+                      errors.append(f"메가박스 지점이 '{rows[0]['brch']}'로 나옴 (코드 {st['mega_brch']})")
+                  target = next((r for r in rows if r["time"] == MEGA_TIME), None)
+                  if target is None:
+                      status.append(f"메가박스 {MEGA_THEATER} {pretty(MEGA_TIME)}: 회차 안 보임")
+                  else:
+                      seats, prev = target["seats"], st.get("mega_seats")
+                      status.append(f"메가박스 {MEGA_THEATER} {pretty(MEGA_TIME)}: 잔여 {seats}석")
+                      if seats > 0 and (prev is None or prev == 0):
+                          alerts.append(f"🎉 메가박스 {MEGA_THEATER} 취소표!")
+                      st["mega_seats"] = seats
+              except Exception as e:  # noqa: BLE001
+                  errors.append(f"메가박스: {e}")
+
+              # CGV 3곳
+              sites = st.setdefault("cgv_sites", {})
+              missing = [n for n in CGV_THEATERS if n not in sites]
+              if missing:
+                  try:
+                      sites.update(cgv.find_sites(missing))
+                  except Exception as e:  # noqa: BLE001
+                      errors.append(f"CGV 극장 목록: {e}")
+              opened = st.setdefault("cgv_open", {})
+              first_seats = st.setdefault("cgv_first_seats", {})
+              for n in CGV_THEATERS:
+                  if n not in sites:
+                      errors.append(f"CGV {n}: 극장 코드를 못 찾음")
+                      continue
+                  try:
+                      rows = cgv.schedule(sites[n])
+                  except Exception as e:  # noqa: BLE001
+                      errors.append(f"CGV {n}: {e}")
+                      continue
+                  if not rows:
+                      status.append(f"CGV {n}: 아직 안 열림")
+                      continue
+                  first = rows[0]
+                  status.append(f"CGV {n}: 열림 (첫 회차 잔여 {first['seats']}석)")
+                  if not opened.get(n):
+                      alerts.append(f"🎬 CGV {n} 열림!")
+                      opened[n] = True
+                  elif first_seats.get(n) == 0 and first["seats"] > 0:
+                      alerts.append(f"🎉 CGV {n} 취소표!")
+                  first_seats[n] = first["seats"]
+
+              # 롯데시네마 (14:30 이전 회차)
+              cinemas = st.setdefault("lotte_cinemas", {})
+              missing = [n for n in LOTTE_THEATERS if n not in cinemas]
+              if missing:
+                  try:
+                      cinemas.update(lotte.find_cinemas(missing))
+                  except Exception as e:  # noqa: BLE001
+                      errors.append(f"롯데시네마 지점 목록: {e}")
+              lotte_seen = st.setdefault("lotte_seen", {})
+              for n in LOTTE_THEATERS:
+                  if n not in cinemas:
+                      errors.append(f"롯데시네마 {n}: 지점 코드를 못 찾음")
+                      continue
+                  try:
+                      rows = [r for r in lotte.schedule(cinemas[n]) if r["time"] < LOTTE_BEFORE]
+                  except Exception as e:  # noqa: BLE001
+                      errors.append(f"롯데시네마 {n}: {e}")
+                      continue
+                  seen = lotte_seen.setdefault(n, {})
+                  if not rows:
+                      status.append(f"롯데시네마 {n}: {pretty(LOTTE_BEFORE)} 이전 회차 아직 안 열림")
+                  else:
+                      status.append(f"롯데시네마 {n}: {pretty(LOTTE_BEFORE)} 이전 {len(rows)}회차 열림")
+                  new_open = False
+                  for r in rows:
+                      key = f"{r['time']}|{r['screen']}"
+                      if key not in seen:
+                          new_open = True
+                      seen[key] = r["seats"]
+                  if new_open:
+                      alerts.append(f"🎬 롯데시네마 {n} 열림!")
+              return alerts, status, errors
+
+
+          def main():
+              if not TOKEN:
+                  sys.exit("TELEGRAM_BOT_TOKEN 시크릿이 없습니다. Settings > Secrets 에 등록해 주세요.")
+              out = os.environ.get("GITHUB_OUTPUT")
+              if now_kst() > STOP_AT:
+                  log("감시 기간이 끝났습니다. 자동으로 꺼집니다.")
+                  if out:
+                      with open(out, "a") as f:
+                          f.write("done=true\n")
+                  return
+
+              st = load_state()
+              cgv, mega, lotte = CGV(), Mega(), Lotte()
+              if not st.get("mega_brch"):
+                  st["mega_brch"] = mega.find_brch(MEGA_THEATER)
+
+              end = time.time() + LOOP_MINUTES * 60
+              first_cycle = True
+              while True:
+                  newly_linked = False
+                  if not st.get("chat_id"):
+                      st["chat_id"] = find_chat_id()
+                      if st["chat_id"]:
+                          newly_linked = True
+                          log("텔레그램 연결됨")
+                      else:
+                          log("텔레그램 대화방을 못 찾음: 봇에게 아무 메시지나 보내 주세요")
+
+                  alerts, status, errors = check_once(st, cgv, mega, lotte)
+                  for line in status + errors:
+                      log(line)
+
+                  if newly_linked or (MANUAL and first_cycle):
+                      head = "✅ 치이카와 알림봇 연결 완료!" if newly_linked else "📋 지금 상황"
+                      body = "\n".join(f"· {s}" for s in status) or "· (확인된 정보 없음)"
+                      if errors:
+                          body += "\n⚠️ " + "\n⚠️ ".join(errors)
+                      send(st, f"{head}\n{body}")
+                  for a in alerts:
+                      send(st, a)
+
+                  if errors and not st.get("err_notified") and not (MANUAL and first_cycle):
+                      if send(st, "⚠️ 알림봇 확인 중 오류가 났어요 (계속 재시도 중)\n" + "\n".join(errors)):
+                          st["err_notified"] = True
+                  if not errors:
+                      st["err_notified"] = False
+
+                  save_state(st)
+                  first_cycle = False
+                  if time.time() + INTERVAL_SEC > end or now_kst() > STOP_AT:
+                      break
+                  time.sleep(INTERVAL_SEC + random.randint(-5, 5))
+              log("이번 실행 종료")
+
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python watch.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+
+      - name: Turn off after 11/11
+        if: steps.watch.outputs.done == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "${{ github.workflow }}" --repo "${{ github.repository }}"
